@@ -1,111 +1,94 @@
 import { TwitterApi } from 'twitter-api-v2';
-import OAuth2User from 'twitter-api-v2';
 
 import { ENV } from '../lib/env';
-import { prisma } from '../lib/prisma';
+import { Mongo } from '../lib/mongo';
+import { User } from '../models/User';
+import { Account } from '../models/Account';
 
-export const scopes = [
-  'users.read',
-  'tweet.read',
-  'tweet.write',
-  'media.write',
-  'offline.access',
-];
+// We will use OAuth 1.0a exclusively to enable media uploads.
+// OAuth2 flow removed to keep a single callback.
+export const scopes: string[] = [];
 
+// Kept for compatibility but unused now
 export function makeOAuth2Client() {
+  throw new Error('OAuth2 flow disabled. Use OAuth1.');
+}
+
+export function makeOAuth1AppClient() {
+  if (!ENV.X_API_KEY || !ENV.X_API_SECRET) {
+    throw new Error('Missing X_API_KEY/X_API_SECRET for OAuth1 flow');
+  }
   return new TwitterApi({
-    clientId: ENV.X_CLIENT_ID,
-    clientSecret: ENV.X_CLIENT_SECRET,
-  });
+    appKey: ENV.X_API_KEY,
+    appSecret: ENV.X_API_SECRET,
+  } as any);
 }
 
-/** Step 1: get URL + codeVerifier/state */
+/** Step 1: get OAuth1 URL + temporary tokens */
 export async function getAuthUrl() {
-  const client = makeOAuth2Client();
-  const { url, codeVerifier, state } = client.generateOAuth2AuthLink(
-    ENV.X_CALLBACK_URL,
-    { scope: scopes }
-  );
-  return { url, codeVerifier, state };
+  const client = makeOAuth1AppClient();
+  if (!ENV.X_OAUTH1_CALLBACK_URL) throw new Error('Missing X_OAUTH1_CALLBACK_URL env');
+  console.log('Generating OAuth1 auth link with callback:', ENV.X_OAUTH1_CALLBACK_URL);
+  const { url, oauth_token, oauth_token_secret } = await client.generateAuthLink(ENV.X_OAUTH1_CALLBACK_URL);
+  return { url, oauth_token, oauth_token_secret };
 }
 
-/** Step 2: exchange code + verifier -> tokens; upsert user & account */
-export async function handleCallback(params: { state: string; code: string; storedState: string; codeVerifier: string; }) {
-  const { state, code, storedState, codeVerifier } = params;
-  if (state !== storedState) throw new Error('State mismatch');
+/** Step 2: exchange oauth_token + oauth_verifier -> user access tokens; upsert user & account */
+export async function handleCallback(params: { oauth_token: string; oauth_verifier: string; oauth_token_secret: string; }) {
+  const { oauth_token, oauth_verifier, oauth_token_secret } = params;
+  await Mongo.connect();
+  if (!ENV.X_API_KEY || !ENV.X_API_SECRET) throw new Error('Missing X_API_KEY/X_API_SECRET for OAuth1 flow');
+  // Create a temporary client bound to request token/secret, then exchange with verifier
+  const tempClient = new TwitterApi({
+    appKey: ENV.X_API_KEY,
+    appSecret: ENV.X_API_SECRET,
+    accessToken: oauth_token,
+    accessSecret: oauth_token_secret,
+  } as any);
+  const { accessToken, accessSecret, screenName, userId: xUserId } = await tempClient.login(oauth_verifier as any);
 
-  const client = makeOAuth2Client();
-  const { client: loggedClient, accessToken, refreshToken, expiresIn, scope } =
-    await client.loginWithOAuth2({
-      code,
-      codeVerifier,
-      redirectUri: ENV.X_CALLBACK_URL,
-    });
-
-  // Get user data of the connected account
+  // Build client for the user to fetch profile
+  const loggedClient = new TwitterApi({
+    appKey: ENV.X_API_KEY,
+    appSecret: ENV.X_API_SECRET,
+    accessToken,
+    accessSecret,
+  } as any);
   const me = await loggedClient.v2.me({ 'user.fields': ['profile_image_url', 'name', 'username'] });
-  const xUserId = me.data.id;
 
-  const user = await prisma.user.upsert({
-    where: { xUserId },
-    create: {
-      xUserId,
-      handle: me.data.username,
+  // upsert User
+  await User.findByIdAndUpdate(
+    xUserId,
+    {
+      _id: xUserId,
+      handle: me.data.username || screenName,
       name: me.data.name,
       imageUrl: me.data.profile_image_url || null,
-      accounts: {
-        create: {
-          provider: 'x',
-          accessToken,
-          refreshToken: refreshToken!, // present because offline.access
-          expiresAt: new Date(Date.now() + (expiresIn! * 1000)),
-          scope: scope?.join(' ') || '',
-          tokenType:'bearer',
-        },
-      },
     },
-    update: {
-      handle: me.data.username,
-      name: me.data.name,
-      imageUrl: me.data.profile_image_url || null,
-      accounts: {
-        updateMany: {
-          where: { provider: 'x' },
-          data: {
-            accessToken,
-            refreshToken: refreshToken!,
-            expiresAt: new Date(Date.now() + (expiresIn! * 1000)),
-            scope: scope?.join(' ') || '',
-            tokenType:'bearer',
-          },
-        },
-      },
-    },
-  });
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
 
-  return { userId: user.id };
+  // upsert Account with OAuth1 tokens
+  await Account.updateOne(
+    { userId: xUserId, provider: 'x' },
+    {
+      $set: {
+        oauthToken: accessToken,
+        oauthTokenSecret: accessSecret,
+      },
+      $setOnInsert: { userId: xUserId, provider: 'x' },
+    },
+    { upsert: true }
+  );
+
+  return { userId: xUserId };
 }
 
 /** Ensure fresh access token using refresh token (offline.access) */
-export async function getUserOAuth2(userId: string): Promise<OAuth2User> {
-  const acc = await prisma.account.findFirstOrThrow({ where: { userId, provider: 'x' } });
-  // token not expired?
-  if (acc.expiresAt.getTime() - Date.now() > 60_000) {
-    return new TwitterApi(acc.accessToken);
-  }
-  // refresh
-  const base = makeOAuth2Client();
-  const { client, accessToken, refreshToken, expiresIn, scope } =
-    await base.refreshOAuth2Token(acc.refreshToken);
-  await prisma.account.update({
-    where: { id: acc.id },
-    data: {
-      accessToken,
-      refreshToken,
-      expiresAt: new Date(Date.now() + (expiresIn! * 1000)),
-      scope: scope?.join(' ') || acc.scope,
-      tokenType: acc.tokenType,
-    },
-  });
-  return client;
+// getUserOAuth2 deprecated
+export async function getUserOAuth2(_: string): Promise<TwitterApi> {
+  throw new Error('OAuth2 flow disabled. Use OAuth1 tokens from Account.');
 }
+
+/** OAuth 1.0a: start flow (for media upload). Returns URL and oauth_token/secret */
+// OAuth1 helpers are integrated into getAuthUrl/handleCallback above

@@ -1,6 +1,7 @@
 import cron from 'node-cron';
-import { prisma } from '../lib/prisma';
 import { postText, postWithMedia } from '../posts/poster';
+import { Mongo } from '../lib/mongo';
+import { Schedule } from '../models/Schedule';
 
 // naive in-memory counters; for production, persist & rate-limit per user/app
 const postedThisMonth = { app: 0 }; // track to respect Free tier caps (500/month)
@@ -11,7 +12,8 @@ async function runTick(now = new Date()) {
   // reset counters monthly
   if (monthKey() !== currentMonth) { currentMonth = monthKey(); postedThisMonth.app = 0; }
 
-  const schedules = await prisma.schedule.findMany({ where: { enabled: true } });
+  await Mongo.connect();
+  const schedules = await Schedule.find({ enabled: true }).lean();
   for (const s of schedules) {
     // cron match: node-cron will trigger per schedule; we also provide a catch-up tick
     // but here we schedule each cron below; this function is for on-boot sweep if desired
@@ -20,7 +22,8 @@ async function runTick(now = new Date()) {
 
 // Register a cron for each schedule on boot (dynamic schedules)
 export async function startScheduler() {
-  const schedules = await prisma.schedule.findMany({ where: { enabled: true } });
+  await Mongo.connect();
+  const schedules = await Schedule.find({ enabled: true }).lean();
 
   schedules.forEach((s:any) => {
     cron.schedule(s.cron, async () => {
@@ -38,7 +41,7 @@ export async function startScheduler() {
         }
 
         postedThisMonth.app += 1;
-        await prisma.schedule.update({ where: { id: s.id }, data: { lastRunAt: new Date() } });
+        await Schedule.updateOne({ _id: s._id }, { $set: { lastRunAt: new Date() } });
         console.log(`[ok] posted for user=${s.userId} schedule=${s.name}`);
       } catch (e) {
         console.error(`[fail] schedule=${s.id}`, e);

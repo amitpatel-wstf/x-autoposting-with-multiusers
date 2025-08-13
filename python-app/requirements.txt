@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+tweepy
+pymongo
+python-dotenv
+requests
+starlette
+pydantic
+itsdangerous
